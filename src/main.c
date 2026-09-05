@@ -18,7 +18,7 @@ static const char *TAG = "wifiscan";
 // Sanity: 256 glyphs x 5 bytes (catches font table corruption)
 _Static_assert(sizeof(font5x7) == 1280, "font5x7 must be 256x5 bytes");
 
-// ---- 0.42" OLED: SSD1306-compatible, 72x40, I2C 0x3C, column offset 28 ----
+// 0.42" OLED: SSD1306?, 72x40, I2C 0x3C, column offset 28
 #define OLED_ADDR   0x3C
 #define OLED_WIDTH  72
 #define OLED_HEIGHT 40
@@ -28,7 +28,7 @@ _Static_assert(sizeof(font5x7) == 1280, "font5x7 must be 256x5 bytes");
 #define I2C_PORT I2C_NUM_0
 #define I2C_FREQ 400000
 
-// ---- 5x7 text: 6px wide (5+spacing) x 8px tall -> 12 cols x 5 rows ----
+// 5x7 text: 6px wide (5+spacing) x 8px tall -> 12 cols x 5 rows
 #define CHAR_W 6
 #define CHAR_H 8
 #define TEXT_COLS (OLED_WIDTH / CHAR_W)    // 12
@@ -39,7 +39,7 @@ _Static_assert(sizeof(font5x7) == 1280, "font5x7 must be 256x5 bytes");
 
 static uint8_t fb[OLED_WIDTH * OLED_PAGES];
 
-// ---------- OLED low level ----------
+// OLED
 
 static esp_err_t oled_write_cmd(uint8_t cmd) {
     i2c_cmd_handle_t h = i2c_cmd_link_create();
