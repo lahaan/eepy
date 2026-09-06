@@ -12,6 +12,8 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "font5x7.h"
+#include "rf_proto.h"
+#include "rf_tx.h"
 
 static const char *TAG = "wifiscan";
 
@@ -291,9 +293,11 @@ void app_main(void) {
 
     show_msg("WiFi scan", "starting...");
     wifi_init_sta();
-    ESP_LOGI(TAG, "wifi started, scanning...");
+    rf_tx_init();
+    ESP_LOGI(TAG, "wifi started, scanning... TX on GPIO%d", EEPY_ESP32_TX_PIN);
 
     static wifi_ap_record_t aps[MAX_APS];
+    static uint8_t rf_seq = 0;
 
     while (1) {
         show_msg("Scanning", "...");
@@ -320,11 +324,18 @@ void app_main(void) {
                      aps[i].rssi, aps[i].primary, ssid);
         }
 
-        // Walk the cache one screen at a time, then loop back to rescan.
+        // Walk the cache one screen at a time, TX each AP to Pico over
+        // MX-FS-03V, then loop back to rescan.
         for (int i = 0; i < n; i++) {
             show_ap(i, n, &aps[i]);
+            uint32_t code = eepy_encode(rf_seq, (uint8_t)i, (uint8_t)n,
+                                        aps[i].rssi, aps[i].primary);
+            rf_tx_send(code);
+            ESP_LOGI(TAG, "  TX %d/%d seq=%u rssi=%d ch=%d code=%lu", i + 1, n,
+                     rf_seq, aps[i].rssi, aps[i].primary, (unsigned long)code);
             vTaskDelay(pdMS_TO_TICKS(DWELL_MS));
         }
+        rf_seq++;
         // End of list -> rescan (picks up new/gone networks) and wrap to 1.
     }
 }

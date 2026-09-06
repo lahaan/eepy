@@ -24,11 +24,11 @@ extern "C" {
 
 #define EEPY_RF_BITLEN 32u
 
-// FS1000A (TX) + XY-MK-5V (RX) wiring TODO (solder later):
-//   ESP32-C3 GPIO4 -> TX module DATA (3.3V logic OK, module VCC to 5V)
-//   RX module DATA -> Pico GP16 via voltage divider (RX outputs 5V! 10k/20k to 3.3V)
-//   Common GND required. Antennas: 17.3cm wire on both ANT pads.
-// Pins are placeholders until you solder - change here only.
+// FS1000A (TX) + XY-MK-5V (RX) wiring:
+//   ESP32-C3 GPIO4 -> TX module DATA (3.3V logic OK, module VCC to board 5V/VU)
+//   RX module DATA -> 10k -> Pico GP16 -> 20k -> GND (=3.3V tap, orientation matters)
+//   RX module VCC from Pico VBUS/VSYS (5V when USB plugged), GND to Pico GND.
+//   RP2350 GPIOs are NOT 5V-tolerant. Antennas: 17.3cm wire on both ANT pads.
 #define EEPY_ESP32_TX_PIN 4
 #define EEPY_PICO_RX_PIN 16
 
