@@ -3,7 +3,7 @@
 #include "esp_err.h"
 
 // Locked-AP RSSI sampler. Puts the radio in promiscuous mode on the target's
-// channel and keeps beacons / probe responses sent by the target BSSID.
+// channel and keeps beacons sent by the target BSSID.
 // APs beacon every ~102ms, so this gives ~10 samples/s without associating.
 // Call sniff_stop() before a full scan (scan fails while promiscuous).
 

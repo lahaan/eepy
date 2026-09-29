@@ -6,7 +6,6 @@
 #include "freertos/FreeRTOS.h"
 
 #define FC_BEACON     0x80
-#define FC_PROBE_RESP 0x50
 #define HDR_LEN       24
 #define ADDR2_OFF     10 // transmitter address (== BSSID for AP mgmt frames)
 
@@ -21,7 +20,9 @@ static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
   const uint8_t *f = p->payload;
   if (p->rx_ctrl.sig_len < HDR_LEN) return;
-  if (f[0] != FC_BEACON && f[0] != FC_PROBE_RESP) return;
+  // Beacons only: probe responses arrive in bursts right after our own scan
+  // and would inflate the beacons/s rate.
+  if (f[0] != FC_BEACON) return;
   if (memcmp(f + ADDR2_OFF, target, 6) != 0) return;
 
   int rssi = p->rx_ctrl.rssi;

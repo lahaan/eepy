@@ -3,6 +3,7 @@
 // Wiring (after soldering): RX DATA -> GP12 (phys pin 16) via div (5.1k/10k),
 // common GND, 17.3cm antenna wire (optional).
 // pio run -e pico2w -t upload && pio device monitor -e pico2w
+// Output: one JSON object per line (lines not starting with '{' are chatter).
 
 #include <Arduino.h>
 #include <RCSwitch.h>
@@ -35,7 +36,8 @@ void loop() {
     unsigned int bits = rx.getReceivedBitlength();
     if (code == 0 || bits != EEPY_RF_BITLEN) {
       ignored++;
-      Serial.printf("[pico-hub] ignored: value=%lu bits=%u (ignored=%lu)\n", code, bits, ignored);
+      Serial.printf("{\"t\":\"rf_bad\",\"value\":%lu,\"bits\":%u,\"ignored\":%lu}\n",
+                    code, bits, ignored);
     } else if (code == last_code && millis() - last_code_ms < 1000) {
       // ESP32 repeats each code RF_REPEAT times; drop the extra decodes.
       last_code_ms = millis();
@@ -46,10 +48,10 @@ void loop() {
       uint8_t seq, idx, total, ch, flags;
       int rssi;
       eepy_decode((uint32_t)code, &seq, &idx, &total, &rssi, &ch, &flags);
-      Serial.printf("[pico-hub] %s %u/%u seq=%u rssi=%d ch=%u (raw %lu, got=%lu)\n",
-                    (flags & EEPY_FLAG_LOCK) ? "LOCK" : "scan", idx + 1, total,
-                    seq, rssi, ch, code, got);
-      // TODO: push to web UI ring buffer / BLE GATT or have CLI to dump to 
+      // Same JSON line format as the ESP32's BLE UART samples (src/main.c).
+      Serial.printf("{\"t\":\"s\",\"src\":\"rf\",\"seq\":%u,\"i\":%u,\"n\":%u,"
+                    "\"rssi\":%d,\"ch\":%u,\"lock\":%d,\"got\":%lu}\n",
+                    seq, idx + 1, total, rssi, ch, (flags & EEPY_FLAG_LOCK) ? 1 : 0, got);
     }
     rx.resetAvailable();
   }
@@ -67,7 +69,8 @@ void loop() {
   }
   if (millis() - last_report >= 10000) {
     last_report = millis();
-    Serial.printf("[pico-hub] alive: GP%d toggles/10s=%lu level=%d got=%lu ignored=%lu\n",
+    Serial.printf("{\"t\":\"diag\",\"pin\":%d,\"toggles_10s\":%lu,\"level\":%d,"
+                  "\"got\":%lu,\"ignored\":%lu}\n",
                   EEPY_PICO_RX_PIN, toggles, lvl, got, ignored);
     toggles = 0;
   }

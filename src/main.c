@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c.h"
@@ -15,6 +16,7 @@
 #include "rf_proto.h"
 #include "rf_tx.h"
 #include "sniff.h"
+#include "ble_uart.h"
 #include "esp_mac.h"
 
 static const char *TAG = "wifiscan";
@@ -47,6 +49,8 @@ _Static_assert(sizeof(font5x7) == 1280, "font5x7 must be 256x5 bytes");
 
 #define BTN_GPIO    9      // BOOT button: short = next AP, long = rescan
 #define BTN_LONG_MS 800
+
+#define BLE_NAME "eepy-probe"
 
 static uint8_t fb[OLED_WIDTH * OLED_PAGES];
 
@@ -224,7 +228,8 @@ static int wifi_scan(wifi_ap_record_t *out, int max) {
         .channel = 0,          // all channels
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time = { .active = { .min = 100, .max = 300 } },
+        // scan_time left 0 = driver default; custom times are rejected (and the
+        // scan drags to ~9s) when BT is enabled, as the driver warns.
     };
     if (esp_wifi_scan_start(&sc, true) != ESP_OK) return -1;
     uint16_t n = 0;
@@ -343,6 +348,85 @@ static int button_poll(void) {
 static wifi_ap_record_t aps[MAX_APS];
 static int n_aps, cur;
 
+// Live sample state, reset whenever the target changes.
+static bool have;
+static int rssi, rate;
+static uint32_t last_win, last_rx, last_rf;
+static uint8_t rf_seq;
+
+// ---------- JSON lines (BLE out; the Pico prints the same format) ----------
+//   {"t":"ap","i":1,"n":3,"bssid":"..","ch":1,"rssi":-52,"enc":1,"ssid":".."}
+//   {"t":"lock","i":1,"n":3,"bssid":"..","ch":1,"ssid":".."}
+//   {"t":"s","src":"ble","seq":12,"i":1,"n":3,"rssi":-52,"rate":9,"ch":1}
+//   {"t":"ok","cmd":".."} / {"t":"err","msg":".."}
+// Indices are 1-based, matching the OLED and the `lock N` command.
+
+// SSID as a JSON string body: escape quotes/backslashes, drop control chars.
+static void json_ssid(const wifi_ap_record_t *ap, char *dst, size_t n) {
+    char ssid[37];
+    ssid_to_str(ap, ssid, sizeof(ssid));
+    size_t o = 0;
+    for (const char *s = ssid; *s && o + 2 < n; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x20) continue;
+        if (c == '"' || c == '\\') dst[o++] = '\\';
+        dst[o++] = (char)c;
+    }
+    dst[o] = '\0';
+}
+
+static void send_ap(int i) {
+    char ssid[80], line[200];
+    json_ssid(&aps[i], ssid, sizeof(ssid));
+    snprintf(line, sizeof(line),
+             "{\"t\":\"ap\",\"i\":%d,\"n\":%d,\"bssid\":\"" MACSTR "\",\"ch\":%d,"
+             "\"rssi\":%d,\"enc\":%d,\"ssid\":\"%s\"}",
+             i + 1, n_aps, MAC2STR(aps[i].bssid), aps[i].primary, aps[i].rssi,
+             aps[i].authmode != WIFI_AUTH_OPEN, ssid);
+    ble_uart_send(line);
+}
+
+static void send_lock(void) {
+    char ssid[80], line[200];
+    json_ssid(&aps[cur], ssid, sizeof(ssid));
+    snprintf(line, sizeof(line),
+             "{\"t\":\"lock\",\"i\":%d,\"n\":%d,\"bssid\":\"" MACSTR "\",\"ch\":%d,"
+             "\"ssid\":\"%s\"}",
+             cur + 1, n_aps, MAC2STR(aps[cur].bssid), aps[cur].primary, ssid);
+    ble_uart_send(line);
+}
+
+static void send_list(void) {
+    for (int i = 0; i < n_aps; i++) send_ap(i);
+    if (n_aps) send_lock();
+}
+
+static void send_sample(void) {
+    char line[160], r[8];
+    if (have) snprintf(r, sizeof(r), "%d", rssi);
+    else strcpy(r, "null");
+    snprintf(line, sizeof(line),
+             "{\"t\":\"s\",\"src\":\"ble\",\"seq\":%u,\"i\":%d,\"n\":%d,"
+             "\"rssi\":%s,\"rate\":%d,\"ch\":%d}",
+             rf_seq, cur + 1, n_aps, r, rate, aps[cur].primary);
+    ble_uart_send(line);
+}
+
+static void send_status(const char *type, const char *key, const char *val) {
+    char line[160];
+    snprintf(line, sizeof(line), "{\"t\":\"%s\",\"%s\":\"%s\"}", type, key, val);
+    ble_uart_send(line);
+}
+
+// ---------- targeting ----------
+
+static void reset_sample(void) {
+    have = false;
+    rate = 0;
+    sniff_take(NULL);
+    last_win = last_rx = now_ms();
+}
+
 static void lock_ap(int i) {
     cur = i;
     esp_err_t r = sniff_start(aps[i].bssid, aps[i].primary);
@@ -350,6 +434,9 @@ static void lock_ap(int i) {
     ssid_to_str(&aps[i], ssid, sizeof(ssid));
     ESP_LOGI(TAG, "lock %d/%d %s " MACSTR " ch%d (%s)", i + 1, n_aps, ssid,
              MAC2STR(aps[i].bssid), aps[i].primary, esp_err_to_name(r));
+    reset_sample();
+    show_lock(&aps[cur], cur, n_aps, have, rssi, rate);
+    send_lock();
 }
 
 // Full scan, then lock onto `want` if it's still around, else the strongest.
@@ -361,6 +448,7 @@ static void scan_and_lock(const uint8_t *want) {
         n_aps = 0;
         ESP_LOGW(TAG, "scan: %s", n < 0 ? "failed" : "no networks");
         show_msg(n < 0 ? "Scan failed" : "No networks", "retry...");
+        send_status("err", "msg", n < 0 ? "scan failed" : "no networks");
         return;
     }
     n_aps = n;
@@ -372,8 +460,61 @@ static void scan_and_lock(const uint8_t *want) {
         ESP_LOGI(TAG, "  %d/%d rssi=%d ch=%d " MACSTR " %s", i + 1, n,
                  aps[i].rssi, aps[i].primary, MAC2STR(aps[i].bssid), ssid);
         if (want && memcmp(aps[i].bssid, want, 6) == 0) pick = i;
+        send_ap(i);
     }
     lock_ap(pick);
+}
+
+// `lock` argument: 1-based index or BSSID (aa:bb:cc:dd:ee:ff).
+static int find_target(const char *arg) {
+    unsigned b[6];
+    if (sscanf(arg, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        for (int i = 0; i < n_aps; i++) {
+            bool eq = true;
+            for (int k = 0; k < 6; k++) eq &= aps[i].bssid[k] == b[k];
+            if (eq) return i;
+        }
+        return -1;
+    }
+    char *end;
+    long idx = strtol(arg, &end, 10);
+    if (end == arg || *end || idx < 1 || idx > n_aps) return -1;
+    return (int)idx - 1;
+}
+
+// Commands (BLE UART): scan | auto | list | next | lock <n|bssid> | help
+static void handle_cmd(char *line) {
+    char *arg = line;
+    while (*arg && *arg != ' ') arg++;
+    if (*arg) *arg++ = '\0';
+    while (*arg == ' ') arg++;
+    for (char *c = line; *c; c++) *c = (char)tolower((unsigned char)*c);
+    ESP_LOGI(TAG, "cmd: %s %s", line, arg);
+
+    if (!strcmp(line, "help")) {
+        send_status("help", "cmds", "scan|auto|list|next|lock <n|bssid>");
+    } else if (!strcmp(line, "list")) {
+        send_list();
+    } else if (!strcmp(line, "scan")) {
+        uint8_t want[6];
+        memcpy(want, aps[cur].bssid, 6);
+        scan_and_lock(n_aps ? want : NULL);
+    } else if (!strcmp(line, "auto")) {
+        scan_and_lock(NULL);
+    } else if (!strcmp(line, "next")) {
+        if (n_aps) lock_ap((cur + 1) % n_aps);
+    } else if (!strcmp(line, "lock")) {
+        int i = find_target(arg);
+        if (i < 0) {
+            send_status("err", "msg", "lock: no such AP (use list)");
+            return;
+        }
+        lock_ap(i);
+    } else {
+        send_status("err", "msg", "unknown command (try help)");
+        return;
+    }
+    send_status("ok", "cmd", line);
 }
 
 void app_main(void) {
@@ -393,24 +534,31 @@ void app_main(void) {
 
     show_msg("WiFi scan", "starting...");
     wifi_init_sta();
+    ble_uart_init(BLE_NAME);
     rf_tx_init();
     if (btn_ok) button_init();
     ESP_LOGI(TAG, "TX on GPIO%d, BOOT button GPIO%d %s", EEPY_ESP32_TX_PIN,
              BTN_GPIO, btn_ok ? "(short=next AP, long=rescan)" : "disabled (I2C)");
 
-    uint8_t rf_seq = 0;
-    bool have = false;
-    int rssi = 0, rate = 0;
-    uint32_t t = now_ms(), last_win = t, last_rx = t, last_rf = t;
+    last_rf = now_ms();
+    bool ble_was_ready = false;
+    char cmd[96];
 
     scan_and_lock(NULL);
     while (1) {
         if (n_aps == 0) {
             vTaskDelay(pdMS_TO_TICKS(3000));
             scan_and_lock(NULL);
-            last_win = last_rx = now_ms();
             continue;
         }
+
+        // New BLE client: give it the AP list and current target.
+        bool ble_ready = ble_uart_ready();
+        if (ble_ready && !ble_was_ready) send_list();
+        ble_was_ready = ble_ready;
+
+        while (ble_uart_read(cmd, sizeof(cmd))) handle_cmd(cmd);
+        if (n_aps == 0) continue; // a command's rescan found nothing
 
         int b = btn_ok ? button_poll() : 0;
         if (b == 1) {
@@ -418,16 +566,9 @@ void app_main(void) {
         } else if (b == 2) {
             scan_and_lock(NULL);
         }
-        if (b) {
-            have = false;
-            rate = 0;
-            sniff_take(NULL);
-            last_win = last_rx = now_ms();
-            if (n_aps) show_lock(&aps[cur], cur, n_aps, have, rssi, rate);
-            continue;
-        }
+        if (b) continue;
 
-        t = now_ms();
+        uint32_t t = now_ms();
         if (t - last_win >= WINDOW_MS) {
             int mean;
             int cnt = sniff_take(&mean);
@@ -441,6 +582,7 @@ void app_main(void) {
                 have = false;
             }
             show_lock(&aps[cur], cur, n_aps, have, rssi, rate);
+            send_sample();
         }
 
         if (t - last_rx >= LOST_MS) {
@@ -449,8 +591,6 @@ void app_main(void) {
             memcpy(want, aps[cur].bssid, 6);
             ESP_LOGW(TAG, "no beacons for %ds, rescanning", LOST_MS / 1000);
             scan_and_lock(want);
-            have = false;
-            last_win = last_rx = now_ms();
             continue;
         }
 
