@@ -11,18 +11,21 @@
 // Full SSID TX needs a RadioHead fix or custom 4b6b ASK layer later.
 //
 // 32-bit code layout (MSB first), sent with RCSwitch.send(code, 32):
-//   [31:24] seq     - scan counter
+//   [31:24] seq     - packet counter
 //   [23:19] index   - AP index (0..31, MAX_APS is 20)
 //   [18:14] total   - APs in scan (0..31)
 //   [13:7]  rssi100 - (rssi + 100), 0..100 (e.g. -52dBm -> 48)
 //   [6:3]   channel - WiFi channel clamped 0..15
-//   [2:0]   reserved (0)
+//   [2:0]   flags   - EEPY_FLAG_*
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define EEPY_RF_BITLEN 32u
+
+// Live beacon-RSSI sample of the locked AP (vs. a plain scan-list entry).
+#define EEPY_FLAG_LOCK 0x1u
 
 // FS1000A (TX) + XY-MK-5V (RX) wiring:
 //   ESP32-C3 GPIO4 -> TX module DATA (3.3V logic OK, module VCC to board 5V/VU)
@@ -34,7 +37,7 @@ extern "C" {
 #define EEPY_PICO_RX_PIN 12
 
 static inline uint32_t eepy_encode(uint8_t seq, uint8_t index, uint8_t total,
-                                   int rssi_dbm, uint8_t channel) {
+                                   int rssi_dbm, uint8_t channel, uint8_t flags) {
   int r100 = rssi_dbm + 100;
   if (r100 < 0) r100 = 0;
   if (r100 > 100) r100 = 100;
@@ -43,16 +46,18 @@ static inline uint32_t eepy_encode(uint8_t seq, uint8_t index, uint8_t total,
   uint8_t ch = channel > 15 ? 15 : channel;
   return ((uint32_t)seq << 24) | ((uint32_t)(index & 31) << 19) |
          ((uint32_t)(total & 31) << 14) | ((uint32_t)(r100 & 127) << 7) |
-         ((uint32_t)(ch & 15) << 3);
+         ((uint32_t)(ch & 15) << 3) | (uint32_t)(flags & 7);
 }
 
 static inline void eepy_decode(uint32_t code, uint8_t *seq, uint8_t *index,
-                               uint8_t *total, int *rssi_dbm, uint8_t *channel) {
+                               uint8_t *total, int *rssi_dbm, uint8_t *channel,
+                               uint8_t *flags) {
   if (seq) *seq = (code >> 24) & 0xFF;
   if (index) *index = (code >> 19) & 0x1F;
   if (total) *total = (code >> 14) & 0x1F;
   if (rssi_dbm) *rssi_dbm = (int)((code >> 7) & 0x7F) - 100;
   if (channel) *channel = (code >> 3) & 0x0F;
+  if (flags) *flags = code & 0x07;
 }
 
 #ifdef __cplusplus
