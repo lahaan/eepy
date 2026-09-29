@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>eepy probe</title>
+<!--
+  Phone UI for the ESP32 "eepy-probe" (BLE, Nordic UART Service).
+  Protocol: JSON lines, see src/main.c. Commands are plain text lines.
+  Web Bluetooth needs HTTPS (GitHub Pages) and Chrome on Android.
+  Append ?demo to the URL for fake data without hardware.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #14161a; --muted: #6b7280;
+    --line: #e3e6eb; --accent: #2563eb; --accent-text: #ffffff;
+    --good: #16a34a; --ok: #ca8a04; --weak: #ea580c; --bad: #dc2626;
+    --lock-bg: #eef3ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --panel: #181b21; --text: #e8eaee; --muted: #9aa1ad;
+      --line: #2a2f38; --accent: #4f8cff; --accent-text: #0b0d10;
+      --good: #34d27b; --ok: #e5b83a; --weak: #f08a4b; --bad: #f25c5c;
+      --lock-bg: #1c2433;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 12px 16px calc(24px + env(safe-area-inset-bottom));
+    max-width: 640px; margin: 0 auto;
+  }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; flex: 1; letter-spacing: .2px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--good); }
+  #status { color: var(--muted); font-size: 13px; }
+  button {
+    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 10px; padding: 10px 14px; min-height: 44px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  .live-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  #ssid { font-weight: 600; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .big { display: flex; align-items: baseline; gap: 6px; margin: 6px 0 2px; }
+  #rssi { font-size: 56px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  #rssi-unit { color: var(--muted); font-size: 18px; }
+  #quality { margin-left: auto; font-weight: 600; font-size: 14px; }
+  #rate { color: var(--muted); font-size: 13px; }
+  canvas { width: 100%; height: 140px; display: block; margin-top: 10px; }
+  .row-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+  .aps-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .aps-head h2 { font-size: 15px; margin: 0; }
+  #aps-count { color: var(--muted); font-size: 13px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li.ap {
+    display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center;
+    padding: 10px; border-radius: 10px; cursor: pointer; border: 1px solid transparent;
+  }
+  li.ap + li.ap { margin-top: 4px; }
+  li.ap.locked { background: var(--lock-bg); border-color: var(--accent); }
+  .ap-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ap-sub { color: var(--muted); font-size: 12px; font-family: ui-monospace, Consolas, monospace; }
+  .ap-rssi { grid-row: span 2; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+  .empty { color: var(--muted); padding: 8px 2px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  #log {
+    margin: 8px 0 0; max-height: 200px; overflow: auto; font: 11px/1.35 ui-monospace, Consolas, monospace;
+    color: var(--muted); white-space: pre-wrap; word-break: break-all;
+  }
+  #toast {
+    position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+    max-width: 608px; margin: 0 auto; background: var(--text); color: var(--bg);
+    padding: 10px 14px; border-radius: 10px; font-size: 14px; opacity: 0; transition: opacity .2s;
+    pointer-events: none;
+  }
+  #toast.show { opacity: .95; }
+  .unsupported { color: var(--bad); font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>eepy probe</h1>
+  <button class="primary" id="connect">Connect</button>
+</header>
+<div id="status">Not connected</div>
+<p class="unsupported" id="unsupported" hidden>
+  Web Bluetooth isn't available here. Use Chrome on Android over HTTPS
+  (or add <code>?demo</code> to the URL to try the UI).
+</p>
+
+<section class="panel" id="live" style="margin-top:10px">
+  <div class="live-top">
+    <div id="ssid">—</div>
+    <div id="meta"></div>
+  </div>
+  <div class="big">
+    <span id="rssi">--</span><span id="rssi-unit">dBm</span>
+    <span id="quality"></span>
+  </div>
+  <div id="rate">&nbsp;</div>
+  <canvas id="chart" aria-label="RSSI over the last minute"></canvas>
+</section>
+
+<div class="row-actions">
+  <button data-cmd="next" disabled>Next</button>
+  <button data-cmd="scan" disabled>Rescan</button>
+  <button data-cmd="auto" disabled>Strongest</button>
+</div>
+
+<section class="panel">
+  <div class="aps-head"><h2>Access points</h2><span id="aps-count"></span></div>
+  <ul id="aps"><li class="empty">Connect to see the scan list. Tap an AP to lock onto it.</li></ul>
+</section>
+
+<details class="panel">
+  <summary>Raw log</summary>
+  <pre id="log"></pre>
+</details>
+
+<div id="toast" role="status"></div>
+
+<script>
+'use strict';
+const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // we write commands
+const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // probe notifies lines
+const HISTORY = 120;        // samples kept for the chart (~60s at 2Hz)
+const Y_MIN = -100, Y_MAX = -30;
+const GOOD_LINE = -67;      // common "good enough for voice" survey threshold
+
+const $ = id => document.getElementById(id);
+const state = { aps: [], lock: null, hist: [], connected: false };
+let device = null, rxChar = null, lineBuf = '', wakeLock = null;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const demo = new URLSearchParams(location.search).has('demo');
+
+// ---------- UI helpers ----------
+
+function quality(r) {
+  if (r == null) return { label: '', color: 'var(--muted)' };
+  if (r >= -60) return { label: 'Excellent', color: 'var(--good)' };
+  if (r >= -67) return { label: 'Good', color: 'var(--good)' };
+  if (r >= -75) return { label: 'Fair', color: 'var(--ok)' };
+  if (r >= -85) return { label: 'Weak', color: 'var(--weak)' };
+  return { label: 'Poor', color: 'var(--bad)' };
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+function log(line) {
+  const el = $('log');
+  el.textContent += line + '\n';
+  if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-15000);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setConnected(on, text) {
+  state.connected = on;
+  $('dot').classList.toggle('on', on);
+  $('status').textContent = text;
+  $('connect').textContent = on ? 'Disconnect' : (device ? 'Reconnect' : 'Connect');
+  document.querySelectorAll('[data-cmd]').forEach(b => (b.disabled = !on));
+}
+
+function renderAps() {
+  const ul = $('aps');
+  $('aps-count').textContent = state.aps.length ? `${state.aps.length} found` : '';
+  if (!state.aps.length) {
+    ul.innerHTML = '<li class="empty">No scan list yet.</li>';
+    return;
+  }
+  ul.replaceChildren(...state.aps.map(ap => {
+    const li = document.createElement('li');
+    li.className = 'ap' + (state.lock && state.lock.bssid === ap.bssid ? ' locked' : '');
+    const name = document.createElement('div');
+    name.className = 'ap-name';
+    name.textContent = (ap.enc ? '🔒 ' : '') + ap.ssid;
+    const r = document.createElement('div');
+    r.className = 'ap-rssi';
+    r.textContent = ap.rssi;
+    r.style.color = quality(ap.rssi).color;
+    const sub = document.createElement('div');
+    sub.className = 'ap-sub';
+    sub.textContent = `${ap.bssid} · ch ${ap.ch}`;
+    li.append(name, r, sub);
+    li.onclick = () => send(`lock ${ap.bssid}`);
+    return li;
+  }));
+}
+
+function renderLive(s) {
+  const lk = state.lock;
+  $('ssid').textContent = lk ? lk.ssid : '—';
+  $('meta').textContent = lk ? `ch ${lk.ch} · ${lk.i}/${lk.n}` : '';
+  const r = s ? s.rssi : null;
+  $('rssi').textContent = r == null ? '--' : r;
+  const q = quality(r);
+  $('rssi').style.color = r == null ? 'var(--muted)' : q.color;
+  $('quality').textContent = q.label;
+  $('quality').style.color = q.color;
+  $('rate').textContent = s ? `${s.rate} beacons/s${s.rssi == null ? ' · no beacons' : ''}` : ' ';
+  drawChart();
+}
+
+function drawChart() {
+  const c = $('chart'), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const css = getComputedStyle(document.documentElement);
+  const col = n => css.getPropertyValue(n).trim();
+  const padL = 30, padR = 4, padT = 6, padB = 6;
+  const y = v => padT + (Y_MAX - v) / (Y_MAX - Y_MIN) * (h - padT - padB);
+  const x = i => padL + i / (HISTORY - 1) * (w - padL - padR);
+
+  g.font = '10px system-ui, sans-serif';
+  g.textAlign = 'right';
+  g.textBaseline = 'middle';
+  for (const v of [-40, -60, -80, -100]) {
+    g.strokeStyle = col('--line');
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(padL, y(v)); g.lineTo(w - padR, y(v)); g.stroke();
+    g.fillStyle = col('--muted');
+    g.fillText(v, padL - 4, y(v));
+  }
+  g.setLineDash([4, 4]);
+  g.strokeStyle = col('--good');
+  g.beginPath(); g.moveTo(padL, y(GOOD_LINE)); g.lineTo(w - padR, y(GOOD_LINE)); g.stroke();
+  g.setLineDash([]);
+
+  const off = HISTORY - state.hist.length;
+  g.strokeStyle = col('--accent');
+  g.lineWidth = 2;
+  g.lineJoin = 'round';
+  g.beginPath();
+  let pen = false;
+  state.hist.forEach((v, i) => {
+    if (v == null) { pen = false; return; } // gap where beacons were lost
+    const vv = Math.max(Y_MIN, Math.min(Y_MAX, v));
+    if (pen) g.lineTo(x(i + off), y(vv)); else g.moveTo(x(i + off), y(vv));
+    pen = true;
+  });
+  g.stroke();
+}
+
+// ---------- protocol ----------
+
+function handle(msg) {
+  switch (msg.t) {
+    case 'ap':
+      if (msg.i === 1) state.aps = [];
+      state.aps[msg.i - 1] = msg;
+      renderAps();
+      break;
+    case 'lock':
+      if (!state.lock || state.lock.bssid !== msg.bssid) state.hist = [];
+      state.lock = msg;
+      renderAps();
+      renderLive(null);
+      break;
+    case 's':
+      state.hist.push(msg.rssi);
+      if (state.hist.length > HISTORY) state.hist.shift();
+      renderLive(msg);
+      break;
+    case 'err':
+      toast('⚠ ' + msg.msg);
+      break;
+    case 'help':
+      toast(msg.cmds);
+      break;
+  }
+}
+
+// Notifications are MTU-sized chunks; reassemble on '\n'.
+function feed(text) {
+  lineBuf += text;
+  let nl;
+  while ((nl = lineBuf.indexOf('\n')) >= 0) {
+    const line = lineBuf.slice(0, nl).trim();
+    lineBuf = lineBuf.slice(nl + 1);
+    if (!line) continue;
+    log(line);
+    if (line[0] !== '{') continue;
+    try { handle(JSON.parse(line)); } catch (e) { log('! bad json: ' + e.message); }
+  }
+}
+
+async function send(cmd) {
+  log('> ' + cmd);
+  if (demo) return demoCmd(cmd);
+  if (!rxChar) return;
+  try {
+    await rxChar.writeValueWithoutResponse(enc.encode(cmd + '\n'));
+  } catch (e) {
+    toast('Send failed: ' + e.message);
+  }
+}
+
+// ---------- BLE ----------
+
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
+}
+
+async function connectGatt() {
+  setConnected(false, `Connecting to ${device.name || 'probe'}…`);
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(NUS);
+  rxChar = await svc.getCharacteristic(NUS_RX);
+  const txChar = await svc.getCharacteristic(NUS_TX);
+  txChar.addEventListener('characteristicvaluechanged', e => feed(dec.decode(e.target.value)));
+  lineBuf = '';
+  await txChar.startNotifications(); // probe sends the AP list once subscribed
+  setConnected(true, `Connected to ${device.name || 'probe'}`);
+  keepAwake();
+}
+
+async function onConnectClick() {
+  if (demo) return demoStart();
+  if (state.connected) {
+    device.gatt.disconnect();
+    return;
+  }
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [NUS] }, { namePrefix: 'eepy' }],
+        optionalServices: [NUS],
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        rxChar = null;
+        setConnected(false, 'Disconnected');
+        wakeLock?.release?.();
+      });
+    }
+    await connectGatt();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') toast(e.message); // NotFound = picker cancelled
+    setConnected(false, 'Not connected');
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.connected) keepAwake();
+});
+
+// ---------- demo mode (?demo): fake probe, no hardware ----------
+
+let demoTimer = null;
+const demoAps = [
+  { bssid: '34:60:f9:2a:09:2c', ch: 1, rssi: -55, enc: 1, ssid: 'C6' },
+  { bssid: '36:60:f9:2a:09:2c', ch: 1, rssi: -56, enc: 1, ssid: '<hidden>' },
+  { bssid: '20:1f:31:c8:49:2f', ch: 6, rssi: -88, enc: 1, ssid: 'Elion' },
+  { bssid: 'a4:2b:b0:11:22:33', ch: 11, rssi: -71, enc: 0, ssid: 'Cafe Guest' },
+];
+let demoCur = 0, demoSeq = 0, demoT = 0;
+
+function demoEmit(o) { feed(JSON.stringify(o) + '\n'); }
+function demoList() {
+  demoAps.forEach((a, i) => demoEmit({ t: 'ap', i: i + 1, n: demoAps.length, ...a }));
+  demoLock();
+}
+function demoLock() {
+  const a = demoAps[demoCur];
+  demoEmit({ t: 'lock', i: demoCur + 1, n: demoAps.length, bssid: a.bssid, ch: a.ch, ssid: a.ssid });
+}
+function demoCmd(cmd) {
+  const [c, arg] = cmd.split(' ');
+  if (c === 'next') demoCur = (demoCur + 1) % demoAps.length;
+  else if (c === 'auto') demoCur = 0;
+  else if (c === 'lock') {
+    const i = demoAps.findIndex(a => a.bssid === arg);
+    if (i < 0) return demoEmit({ t: 'err', msg: 'lock: no such AP (use list)' });
+    demoCur = i;
+  }
+  if (c === 'scan' || c === 'auto') demoList(); else demoLock();
+  demoEmit({ t: 'ok', cmd: c });
+}
+function demoStart() {
+  if (demoTimer) {
+    clearInterval(demoTimer); demoTimer = null;
+    setConnected(false, 'Disconnected (demo)');
+    return;
+  }
+  setConnected(true, 'Connected to eepy-probe (demo)');
+  demoList();
+  demoTimer = setInterval(() => {
+    demoT += 0.5;
+    const base = demoAps[demoCur].rssi;
+    const lost = Math.random() < 0.03;
+    const r = lost ? null : Math.round(base + 6 * Math.sin(demoT / 4) + (Math.random() * 4 - 2));
+    if (demoT % 2.5 === 0) demoSeq++;
+    demoEmit({ t: 's', src: 'ble', seq: demoSeq, i: demoCur + 1, n: demoAps.length,
+               rssi: r, rate: lost ? 0 : 8 + Math.round(Math.random() * 2), ch: demoAps[demoCur].ch });
+  }, 500);
+}
+
+// ---------- boot ----------
+
+$('connect').onclick = onConnectClick;
+document.querySelectorAll('[data-cmd]').forEach(b => (b.onclick = () => send(b.dataset.cmd)));
+window.addEventListener('resize', drawChart);
+if (!demo && !navigator.bluetooth) {
+  $('unsupported').hidden = false;
+  $('connect').disabled = true;
+}
+if (demo) $('status').textContent = 'Demo mode: tap Connect';
+renderLive(null);
+</script>
+</body>
+</html>
