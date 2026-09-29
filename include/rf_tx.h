@@ -1,8 +1,8 @@
 #pragma once
 #include <stdint.h>
 
-// MX-FS-03V ASK transmitter (ESP-IDF, rc-switch protocol 1 compatible).
-// No Arduino dependency: bit-bangs EEPY_ESP32_TX_PIN with esp_rom_delay_us.
+// MX-FS-03V ASK transmitter (ESP-IDF RMT, rc-switch protocol 1 compatible).
+// No Arduino dependency; rf_tx_send() queues the code and returns.
 // Pairs with Pico RCSwitch RX (protocol auto-detect, 32-bit codes).
 
 #ifdef __cplusplus
