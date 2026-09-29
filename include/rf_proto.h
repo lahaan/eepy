@@ -26,11 +26,12 @@ extern "C" {
 
 // FS1000A (TX) + XY-MK-5V (RX) wiring:
 //   ESP32-C3 GPIO4 -> TX module DATA (3.3V logic OK, module VCC to board 5V/VU)
-//   RX module DATA -> 10k -> Pico GP16 -> 20k -> GND (=3.3V tap, orientation matters)
+//   RX module DATA -> 5.1k -> Pico GP12 (phys pin 16) -> 10k -> GND (=3.3V tap, orientation matters)
 //   RX module VCC from Pico VBUS/VSYS (5V when USB plugged), GND to Pico GND.
+//   Keep the divider low-ohm: 10k/20k gets stuck high (RP2350-E9 input latch).
 //   RP2350 GPIOs are NOT 5V-tolerant. Antennas: 17.3cm wire on both ANT pads.
 #define EEPY_ESP32_TX_PIN 4
-#define EEPY_PICO_RX_PIN 16
+#define EEPY_PICO_RX_PIN 12
 
 static inline uint32_t eepy_encode(uint8_t seq, uint8_t index, uint8_t total,
                                    int rssi_dbm, uint8_t channel) {
