@@ -14,6 +14,8 @@
 #include "font5x7.h"
 #include "rf_proto.h"
 #include "rf_tx.h"
+#include "sniff.h"
+#include "esp_mac.h"
 
 static const char *TAG = "wifiscan";
 
@@ -37,7 +39,14 @@ _Static_assert(sizeof(font5x7) == 1280, "font5x7 must be 256x5 bytes");
 #define TEXT_ROWS (OLED_HEIGHT / CHAR_H)   // 5
 
 #define MAX_APS 20
-#define DWELL_MS 2500
+#define LOOP_MS      50
+#define WINDOW_MS    500   // RSSI averaging window / OLED refresh
+#define STALE_MS     2000  // no beacons this long -> show "---"
+#define LOST_MS      10000 // no beacons this long -> rescan + relock
+#define RF_PERIOD_MS 2500  // one 433MHz code (~224ms on air) -> ~9% duty (EU SRD <=10%)
+
+#define BTN_GPIO    9      // BOOT button: short = next AP, long = rescan
+#define BTN_LONG_MS 800
 
 static uint8_t fb[OLED_WIDTH * OLED_PAGES];
 
@@ -248,39 +257,130 @@ static void ssid_to_str(const wifi_ap_record_t *ap, char *dst, size_t dstsz) {
     dst[len] = '\0';
 }
 
-// One screen per network: header "i/n -52dBm[*]" + SSID wrapped over rows 1..4.
-static void show_ap(int idx, int total, const wifi_ap_record_t *ap) {
-    char hdr[32], ssid[37];
-    const char *lines[TEXT_ROWS];
-    ssid_to_str(ap, ssid, sizeof(ssid));
 
-    // '*' marks encrypted networks ("1/20 -99*" fits 12 cols)
-    snprintf(hdr, sizeof(hdr), "%d/%d %d%s",
-             idx + 1, total, ap->rssi,
-             ap->authmode == WIFI_AUTH_OPEN ? "" : "*");
-    lines[0] = hdr;
+// ---------- lock mode ----------
 
-    // Wrap SSID into 12-char rows (static buffers survive the call)
-    static char rows[4][13];
-    size_t len = strlen(ssid);
-    int r;
-    for (r = 0; r < 4; r++) {
-        size_t off = (size_t)r * 12;
-        if (off >= len) break;
-        size_t n = len - off > 12 ? 12 : len - off;
-        memcpy(rows[r], ssid + off, n);
-        rows[r][n] = '\0';
-        lines[1 + r] = rows[r];
+static inline uint32_t now_ms(void) {
+    return (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
+}
+
+// 5x7 glyph doubled to 10x14.
+static void draw_char_2x(int x, int y, char c) {
+    const uint8_t *g = &font5x7[(uint8_t)c * 5];
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = g[col];
+        for (int row = 0; row < 7; row++) {
+            if (!(bits & (1 << row))) continue;
+            int px = x + col * 2, py = y + row * 2;
+            set_pixel(px, py);
+            set_pixel(px + 1, py);
+            set_pixel(px, py + 1);
+            set_pixel(px + 1, py + 1);
+        }
     }
-    for (; r < 4; r++) lines[1 + r] = NULL;
+}
 
-    show_lines(lines);
+// Lock screen:
+//   SSID
+//   c6 1/5
+//   -52dBm      (2x font)
+//   [bar]  10/s (beacons per second)
+static void show_lock(const wifi_ap_record_t *ap, int idx, int total,
+                      bool have, int rssi, int rate) {
+    char ssid[37], line[40];
+    oled_clear();
+    ssid_to_str(ap, ssid, sizeof(ssid));
+    draw_string(0, 0, ssid);
+    snprintf(line, sizeof(line), "c%d %d/%d", ap->primary, idx + 1, total);
+    draw_string(0, 8, line);
+
+    int x = 0;
+    if (have) {
+        snprintf(line, sizeof(line), "%d", rssi);
+        for (const char *s = line; *s; s++, x += 12) draw_char_2x(x, 17, *s);
+        draw_string(x, 24, "dBm");
+        // -95dBm = empty, -35dBm = full 44px
+        int w = (rssi + 95) * 44 / 60;
+        if (w < 0) w = 0;
+        if (w > 44) w = 44;
+        for (int bx = 0; bx < w; bx++) {
+            for (int by = 33; by < 39; by++) set_pixel(bx, by);
+        }
+    } else {
+        for (const char *s = "---"; *s; s++, x += 12) draw_char_2x(x, 17, *s);
+    }
+    snprintf(line, sizeof(line), "%d/s", rate);
+    draw_string(48, 32, line);
+    oled_flush();
+}
+
+static void button_init(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BTN_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+// Polled from the main loop. Returns 1 on short press, 2 on long, else 0.
+static int button_poll(void) {
+    static bool down = false;
+    static uint32_t down_at;
+    bool pressed = gpio_get_level((gpio_num_t)BTN_GPIO) == 0;
+    if (pressed && !down) {
+        down = true;
+        down_at = now_ms();
+    } else if (!pressed && down) {
+        down = false;
+        return now_ms() - down_at >= BTN_LONG_MS ? 2 : 1;
+    }
+    return 0;
+}
+
+static wifi_ap_record_t aps[MAX_APS];
+static int n_aps, cur;
+
+static void lock_ap(int i) {
+    cur = i;
+    esp_err_t r = sniff_start(aps[i].bssid, aps[i].primary);
+    char ssid[37];
+    ssid_to_str(&aps[i], ssid, sizeof(ssid));
+    ESP_LOGI(TAG, "lock %d/%d %s " MACSTR " ch%d (%s)", i + 1, n_aps, ssid,
+             MAC2STR(aps[i].bssid), aps[i].primary, esp_err_to_name(r));
+}
+
+// Full scan, then lock onto `want` if it's still around, else the strongest.
+static void scan_and_lock(const uint8_t *want) {
+    sniff_stop();
+    show_msg("Scanning", "...");
+    int n = wifi_scan(aps, MAX_APS);
+    if (n <= 0) {
+        n_aps = 0;
+        ESP_LOGW(TAG, "scan: %s", n < 0 ? "failed" : "no networks");
+        show_msg(n < 0 ? "Scan failed" : "No networks", "retry...");
+        return;
+    }
+    n_aps = n;
+    ESP_LOGI(TAG, "found %d networks:", n);
+    int pick = 0; // sorted strongest-first
+    for (int i = 0; i < n; i++) {
+        char ssid[37];
+        ssid_to_str(&aps[i], ssid, sizeof(ssid));
+        ESP_LOGI(TAG, "  %d/%d rssi=%d ch=%d " MACSTR " %s", i + 1, n,
+                 aps[i].rssi, aps[i].primary, MAC2STR(aps[i].bssid), ssid);
+        if (want && memcmp(aps[i].bssid, want, 6) == 0) pick = i;
+    }
+    lock_ap(pick);
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32-C3 wifi scanner on 0.42\" OLED (72x40)");
+    ESP_LOGI(TAG, "ESP32-C3 AP lock / RSSI probe on 0.42\" OLED (72x40)");
 
     bool ok = i2c_try_pins(5, 6);
+    bool btn_ok = ok; // OLED on (8,9) would steal the BOOT button pin
     if (!ok) ok = i2c_try_pins(8, 9);
     if (!ok) {
         ESP_LOGE(TAG, "No OLED at 0x3C on (5,6) or (8,9)");
@@ -294,48 +394,76 @@ void app_main(void) {
     show_msg("WiFi scan", "starting...");
     wifi_init_sta();
     rf_tx_init();
-    ESP_LOGI(TAG, "wifi started, scanning... TX on GPIO%d", EEPY_ESP32_TX_PIN);
+    if (btn_ok) button_init();
+    ESP_LOGI(TAG, "TX on GPIO%d, BOOT button GPIO%d %s", EEPY_ESP32_TX_PIN,
+             BTN_GPIO, btn_ok ? "(short=next AP, long=rescan)" : "disabled (I2C)");
 
-    static wifi_ap_record_t aps[MAX_APS];
-    static uint8_t rf_seq = 0;
+    uint8_t rf_seq = 0;
+    bool have = false;
+    int rssi = 0, rate = 0;
+    uint32_t t = now_ms(), last_win = t, last_rx = t, last_rf = t;
 
+    scan_and_lock(NULL);
     while (1) {
-        show_msg("Scanning", "...");
-        int n = wifi_scan(aps, MAX_APS);
-
-        if (n < 0) {
-            ESP_LOGW(TAG, "scan failed, retrying");
-            show_msg("Scan", "failed...");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
-        }
-        if (n == 0) {
-            ESP_LOGI(TAG, "no networks found");
-            show_msg("No networks", "retry...");
+        if (n_aps == 0) {
             vTaskDelay(pdMS_TO_TICKS(3000));
+            scan_and_lock(NULL);
+            last_win = last_rx = now_ms();
             continue;
         }
 
-        ESP_LOGI(TAG, "found %d networks:", n);
-        for (int i = 0; i < n; i++) {
-            char ssid[37];
-            ssid_to_str(&aps[i], ssid, sizeof(ssid));
-            ESP_LOGI(TAG, "  %d/%d rssi=%d ch=%d %s", i + 1, n,
-                     aps[i].rssi, aps[i].primary, ssid);
+        int b = btn_ok ? button_poll() : 0;
+        if (b == 1) {
+            lock_ap((cur + 1) % n_aps);
+        } else if (b == 2) {
+            scan_and_lock(NULL);
+        }
+        if (b) {
+            have = false;
+            rate = 0;
+            sniff_take(NULL);
+            last_win = last_rx = now_ms();
+            if (n_aps) show_lock(&aps[cur], cur, n_aps, have, rssi, rate);
+            continue;
         }
 
-        // Walk the cache one screen at a time, TX each AP to Pico over
-        // MX-FS-03V, then loop back to rescan.
-        for (int i = 0; i < n; i++) {
-            show_ap(i, n, &aps[i]);
-            uint32_t code = eepy_encode(rf_seq, (uint8_t)i, (uint8_t)n,
-                                        aps[i].rssi, aps[i].primary);
-            rf_tx_send(code);
-            ESP_LOGI(TAG, "  TX %d/%d seq=%u rssi=%d ch=%d code=%lu", i + 1, n,
-                     rf_seq, aps[i].rssi, aps[i].primary, (unsigned long)code);
-            vTaskDelay(pdMS_TO_TICKS(DWELL_MS));
+        t = now_ms();
+        if (t - last_win >= WINDOW_MS) {
+            int mean;
+            int cnt = sniff_take(&mean);
+            rate = (int)(cnt * 1000u / (t - last_win));
+            last_win = t;
+            if (cnt) {
+                rssi = mean;
+                have = true;
+                last_rx = t;
+            } else if (t - last_rx > STALE_MS) {
+                have = false;
+            }
+            show_lock(&aps[cur], cur, n_aps, have, rssi, rate);
         }
-        rf_seq++;
-        // End of list -> rescan (picks up new/gone networks) and wrap to 1.
+
+        if (t - last_rx >= LOST_MS) {
+            // Out of range or changed channel: rescan, stay on it if seen.
+            uint8_t want[6];
+            memcpy(want, aps[cur].bssid, 6);
+            ESP_LOGW(TAG, "no beacons for %ds, rescanning", LOST_MS / 1000);
+            scan_and_lock(want);
+            have = false;
+            last_win = last_rx = now_ms();
+            continue;
+        }
+
+        if (have && t - last_rf >= RF_PERIOD_MS) {
+            last_rf = t;
+            uint32_t code = eepy_encode(rf_seq, (uint8_t)cur, (uint8_t)n_aps,
+                                        rssi, aps[cur].primary, EEPY_FLAG_LOCK);
+            rf_tx_send(code);
+            ESP_LOGI(TAG, "TX seq=%u lock %d/%d rssi=%d %d/s ch=%d", rf_seq,
+                     cur + 1, n_aps, rssi, rate, aps[cur].primary);
+            rf_seq++;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(LOOP_MS));
     }
 }

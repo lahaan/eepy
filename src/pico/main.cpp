@@ -43,11 +43,12 @@ void loop() {
       last_code = code;
       last_code_ms = millis();
       got++;
-      uint8_t seq, idx, total, ch;
+      uint8_t seq, idx, total, ch, flags;
       int rssi;
-      eepy_decode((uint32_t)code, &seq, &idx, &total, &rssi, &ch);
-      Serial.printf("[pico-hub] %u/%u seq=%u rssi=%d ch=%u (raw %lu, got=%lu)\n",
-                    idx + 1, total, seq, rssi, ch, code, got);
+      eepy_decode((uint32_t)code, &seq, &idx, &total, &rssi, &ch, &flags);
+      Serial.printf("[pico-hub] %s %u/%u seq=%u rssi=%d ch=%u (raw %lu, got=%lu)\n",
+                    (flags & EEPY_FLAG_LOCK) ? "LOCK" : "scan", idx + 1, total,
+                    seq, rssi, ch, code, got);
       // TODO: push to web UI ring buffer / BLE GATT or have CLI to dump to 
     }
     rx.resetAvailable();

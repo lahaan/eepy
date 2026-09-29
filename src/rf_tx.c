@@ -14,7 +14,7 @@ static const char *TAG = "rftx";
 
 // rc-switch protocol 1 constants
 #define RF_PULSE_US 350
-#define RF_REPEAT 5 // 10 is lib default; 5 keeps 20-AP cycle reasonable (~280ms/AP)
+#define RF_REPEAT 4 // 10 is lib default; 4 x ~56ms = ~224ms on air per code
 
 static inline void tx_pulse(int high_mult, int low_mult) {
   gpio_set_level((gpio_num_t)EEPY_ESP32_TX_PIN, 1);
