@@ -318,6 +318,7 @@ const isHub = () => state.role === 'hub';
 function drawSky() {
   const c = $('stars'), dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = window.innerWidth, h = window.innerHeight;
+  if (!w || !h) return; // hidden/background tab: no size yet, resize redraws
   c.width = w * dpr; c.height = h * dpr;
   const g = c.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -407,7 +408,7 @@ function setConnected(on, text) {
   state.connected = on;
   $('dot').classList.toggle('on', on);
   $('status').textContent = text;
-  $('connect').textContent = on ? 'disconnect' : (device ? 'reconnect' : 'connect');
+  $('connect').textContent = on ? 'disconnect' : 'connect';
   $('connect').classList.toggle('primary', !on);
   document.querySelectorAll('[data-cmd]').forEach(b => (b.disabled = !on || isHub()));
   if (!on) setSun(null);
@@ -415,7 +416,7 @@ function setConnected(on, text) {
 
 function renderAps() {
   const ul = $('aps');
-  $('aps-count').textContent = state.aps.length ? `${state.aps.length} found` : '';
+  $('aps-count').textContent = state.aps.length ? `${state.aps.length} found \u00b7 rssi at scan, locked live` : '';
   if (!state.aps.length) {
     ul.innerHTML = isHub()
       ? '<li class="empty">the hub only relays the locked ap. connect to eepy-probe for the list and controls.</li>'
@@ -556,11 +557,18 @@ function handle(msg) {
       renderAps();
       renderLive(null);
       break;
-    case 's':
+    case 's': {
+      // List RSSIs come from the last scan; only the locked AP is sniffed live.
+      const ap = state.lock && state.aps.find(a => a && a.bssid === state.lock.bssid);
+      if (ap && msg.rssi != null && ap.rssi !== msg.rssi) {
+        ap.rssi = msg.rssi;
+        renderAps();
+      }
       state.hist.push(msg.rssi);
       if (state.hist.length > HISTORY) state.hist.shift();
       renderLive(msg);
       break;
+    }
     case 'hello':
       state.role = msg.role === 'hub' ? 'hub' : 'probe';
       setConnected(true, connectedText());
@@ -642,6 +650,7 @@ async function onConnectClick() {
       });
       device.addEventListener('gattserverdisconnected', () => {
         rxChar = null;
+        device = null; // next connect opens the picker, so hub <-> probe can switch
         setConnected(false, 'disconnected');
         wakeLock?.release?.();
       });
@@ -649,6 +658,7 @@ async function onConnectClick() {
     await connectGatt();
   } catch (e) {
     if (e.name !== 'NotFoundError') toast(e.message); // NotFound = picker cancelled
+    device = null;
     setConnected(false, 'not connected');
   }
 }
