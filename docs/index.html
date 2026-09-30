@@ -9,6 +9,9 @@
 <!--
   Phone UI for the ESP32 "eepy-probe" (BLE, Nordic UART Service).
   Protocol: JSON lines, see src/main.c. Commands are plain text lines.
+  Also connects to the Pico "eepy-hub" (src/pico/main.cpp): same UUIDs and
+  lines, relayed from the probe over 433MHz. Read-only (433 is one-way), no
+  SSID or AP list, ~1 sample per 2.5s. ?demo=hub fakes the hub.
   Web Bluetooth needs HTTPS (GitHub Pages) and Chrome on Android.
   Append ?demo to the URL for fake data without hardware.
   Look: late-2000s minimal "sunrise over the earth" (the sun tracks RSSI).
@@ -301,10 +304,12 @@ const GOOD_LINE = -67;      // common "good enough for voice" survey threshold
 
 const $ = id => document.getElementById(id);
 const root = document.documentElement;
-const state = { aps: [], lock: null, hist: [], connected: false };
+const state = { aps: [], lock: null, hist: [], connected: false, role: 'probe' };
 let device = null, rxChar = null, lineBuf = '', wakeLock = null;
 const enc = new TextEncoder(), dec = new TextDecoder();
 const demo = new URLSearchParams(location.search).has('demo');
+const demoHub = new URLSearchParams(location.search).get('demo') === 'hub';
+const isHub = () => state.role === 'hub';
 
 // ---------- sky ----------
 
@@ -404,7 +409,7 @@ function setConnected(on, text) {
   $('status').textContent = text;
   $('connect').textContent = on ? 'disconnect' : (device ? 'reconnect' : 'connect');
   $('connect').classList.toggle('primary', !on);
-  document.querySelectorAll('[data-cmd]').forEach(b => (b.disabled = !on));
+  document.querySelectorAll('[data-cmd]').forEach(b => (b.disabled = !on || isHub()));
   if (!on) setSun(null);
 }
 
@@ -412,7 +417,9 @@ function renderAps() {
   const ul = $('aps');
   $('aps-count').textContent = state.aps.length ? `${state.aps.length} found` : '';
   if (!state.aps.length) {
-    ul.innerHTML = '<li class="empty">no scan list yet.</li>';
+    ul.innerHTML = isHub()
+      ? '<li class="empty">the hub only relays the locked ap. connect to eepy-probe for the list and controls.</li>'
+      : '<li class="empty">no scan list yet.</li>';
     return;
   }
   ul.replaceChildren(...state.aps.map(ap => {
@@ -441,8 +448,8 @@ function renderAps() {
 
 function renderLive(s) {
   const lk = state.lock;
-  $('ssid').textContent = lk ? lk.ssid : '—';
-  $('meta').textContent = lk ? `channel ${lk.ch} · ${lk.i} of ${lk.n}` : ' ';
+  $('ssid').textContent = lk ? (lk.ssid || `ap ${lk.i} of ${lk.n}`) : '—';
+  $('meta').textContent = lk ? `channel ${lk.ch} · ${lk.i} of ${lk.n}${lk.src === 'rf' ? ' · via 433' : ''}` : ' ';
   const r = s ? s.rssi : null;
   const q = quality(r);
   $('rssi').textContent = r == null ? '--' : r;
@@ -450,7 +457,9 @@ function renderLive(s) {
   $('rssi').style.textShadow = r == null ? 'none' : `0 0 22px ${q.color}55`;
   $('quality').textContent = q.label || ' ';
   $('quality').style.color = q.color;
-  $('rate').textContent = s ? (s.rssi == null ? 'no beacons' : `${s.rate} beacons/s`) : ' ';
+  $('rate').textContent = !s ? ' '
+    : s.src === 'rf' ? `433 relay · seq ${s.seq}`
+    : s.rssi == null ? 'no beacons' : `${s.rate} beacons/s`;
   if (s) setSun(r);
   drawChart();
 }
@@ -552,6 +561,11 @@ function handle(msg) {
       if (state.hist.length > HISTORY) state.hist.shift();
       renderLive(msg);
       break;
+    case 'hello':
+      state.role = msg.role === 'hub' ? 'hub' : 'probe';
+      setConnected(true, connectedText());
+      renderAps();
+      break;
     case 'err':
       toast(msg.msg);
       break;
@@ -592,7 +606,16 @@ async function keepAwake() {
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
 }
 
+function connectedText() {
+  const name = device?.name || (demoHub ? 'eepy-hub' : 'eepy-probe');
+  return isHub() ? `connected · ${name} · read-only via 433` : `connected · ${name}`;
+}
+
 async function connectGatt() {
+  // The hub also says hello once subscribed; the name is a head start.
+  state.role = (device.name || '').startsWith('eepy-hub') ? 'hub' : 'probe';
+  state.aps = []; state.lock = null; state.hist = [];
+  renderAps(); renderLive(null);
   setConnected(false, `connecting to ${device.name || 'probe'}…`);
   const server = await device.gatt.connect();
   const svc = await server.getPrimaryService(NUS);
@@ -601,7 +624,7 @@ async function connectGatt() {
   txChar.addEventListener('characteristicvaluechanged', e => feed(dec.decode(e.target.value)));
   lineBuf = '';
   await txChar.startNotifications(); // probe sends the AP list once subscribed
-  setConnected(true, `connected · ${device.name || 'probe'}`);
+  setConnected(true, connectedText());
   keepAwake();
 }
 
@@ -672,6 +695,7 @@ function demoStart() {
     setConnected(false, 'disconnected · demo');
     return;
   }
+  if (demoHub) return demoHubStart();
   setConnected(true, 'demo · eepy-probe');
   demoList();
   demoTimer = setInterval(() => {
@@ -683,6 +707,21 @@ function demoStart() {
     demoEmit({ t: 's', src: 'ble', seq: demoSeq, i: demoCur + 1, n: demoAps.length,
                rssi: r, rate: lost ? 0 : 8 + Math.round(Math.random() * 2), ch: demoAps[demoCur].ch });
   }, 500);
+}
+
+// Fake Pico relay: no list, no SSID, one sample per 2.5s.
+function demoHubStart() {
+  state.role = 'hub';
+  setConnected(true, 'demo · eepy-hub · read-only via 433');
+  demoEmit({ t: 'hello', role: 'hub', got: 0 });
+  const a = demoAps[0];
+  demoEmit({ t: 'lock', src: 'rf', i: 1, n: demoAps.length, bssid: `rf-1-${a.ch}`, ch: a.ch, ssid: '' });
+  demoTimer = setInterval(() => {
+    demoT += 2.5; demoSeq++;
+    const r = Math.round(a.rssi + 6 * Math.sin(demoT / 10) + (Math.random() * 4 - 2));
+    demoEmit({ t: 's', src: 'rf', seq: demoSeq, i: 1, n: demoAps.length, rssi: r,
+               ch: a.ch, lock: 1, got: demoSeq, age: 0 });
+  }, 2500);
 }
 
 // ---------- boot ----------
