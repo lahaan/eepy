@@ -46,6 +46,8 @@ _Static_assert(sizeof(font5x7) == 1280, "font5x7 must be 256x5 bytes");
 #define STALE_MS     2000  // no beacons this long -> show "---"
 #define LOST_MS      10000 // no beacons this long -> rescan + relock
 #define RF_PERIOD_MS 2500  // one 433MHz code (~224ms on air) -> ~9% duty (EU SRD <=10%)
+#define NAME_REPEAT_MS  30000  // SSID over 433: second pass after the first
+#define NAME_REFRESH_MS 300000 // then only for a Pico that missed it / rebooted
 
 #define BTN_GPIO    9      // BOOT button: short = next AP, long = rescan
 #define BTN_LONG_MS 800
@@ -418,6 +420,75 @@ static void send_status(const char *type, const char *key, const char *val) {
     ble_uart_send(line);
 }
 
+// ---------- SSID over 433 (see rf_proto.h) ----------
+// The name goes out in 2-byte chunks on lock, once more after NAME_REPEAT_MS,
+// then every NAME_REFRESH_MS; samples carry name_tag in between so the Pico
+// can trust its cached copy. Chunks take every other RF slot while pending.
+
+static uint8_t name_tag;
+static uint8_t name_bytes[EEPY_SSID_MAX];
+static int name_len;
+static uint8_t name_bssid[6];
+static bool name_set;
+static int name_chunk = -1; // next chunk of the current pass, -1 = idle
+static int name_passes;
+static uint32_t name_next_ms;
+static bool rf_chunk_turn;
+static uint8_t recent_tags[4];
+static int recent_n;
+
+static int name_chunks(void) {
+    return name_len >= (int)EEPY_SSID_MAX ? (int)EEPY_SSID_CHUNKS : name_len / 2 + 1;
+}
+
+static void name_start(const wifi_ap_record_t *ap) {
+    if (name_set && memcmp(name_bssid, ap->bssid, 6) == 0) return; // relock, Pico has it
+    // FNV-1a over BSSID + SSID, folded to the tag width.
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) h = (h ^ ap->bssid[i]) * 16777619u;
+    name_len = (int)strnlen((const char *)ap->ssid, EEPY_SSID_MAX);
+    for (int i = 0; i < name_len; i++) h = (h ^ ap->ssid[i]) * 16777619u;
+    uint8_t tag = (uint8_t)((h ^ (h >> 5) ^ (h >> 10) ^ (h >> 15) ^ (h >> 20)) & EEPY_TAG_MASK);
+    // Never reuse a recent tag, so a Pico holding an older name can't match.
+    for (bool clash = true; clash;) {
+        clash = false;
+        for (int i = 0; i < recent_n; i++) {
+            if (recent_tags[i] == tag) {
+                tag = (tag + 1) & EEPY_TAG_MASK;
+                clash = true;
+            }
+        }
+    }
+    memmove(recent_tags + 1, recent_tags, sizeof(recent_tags) - 1);
+    recent_tags[0] = tag;
+    if (recent_n < (int)sizeof(recent_tags)) recent_n++;
+
+    name_tag = tag;
+    memcpy(name_bytes, ap->ssid, name_len);
+    memcpy(name_bssid, ap->bssid, 6);
+    name_set = true;
+    name_chunk = 0;
+    name_passes = 0;
+}
+
+static bool name_pending(uint32_t t) {
+    if (name_chunk < 0 && name_set && (int32_t)(t - name_next_ms) >= 0) name_chunk = 0;
+    return name_chunk >= 0;
+}
+
+static uint32_t name_next_code(uint32_t t, int *chunk) {
+    int k = name_chunk;
+    uint8_t b0 = 2 * k < name_len ? name_bytes[2 * k] : 0;
+    uint8_t b1 = 2 * k + 1 < name_len ? name_bytes[2 * k + 1] : 0;
+    *chunk = k;
+    if (++name_chunk >= name_chunks()) {
+        name_chunk = -1;
+        name_passes++;
+        name_next_ms = t + (name_passes == 1 ? NAME_REPEAT_MS : NAME_REFRESH_MS);
+    }
+    return eepy_encode_chunk((uint8_t)k, b0, b1, name_tag);
+}
+
 // ---------- targeting ----------
 
 static void reset_sample(void) {
@@ -435,6 +506,7 @@ static void lock_ap(int i) {
     ESP_LOGI(TAG, "lock %d/%d %s " MACSTR " ch%d (%s)", i + 1, n_aps, ssid,
              MAC2STR(aps[i].bssid), aps[i].primary, esp_err_to_name(r));
     reset_sample();
+    name_start(&aps[i]);
     show_lock(&aps[cur], cur, n_aps, have, rssi, rate);
     send_lock();
 }
@@ -594,14 +666,24 @@ void app_main(void) {
             continue;
         }
 
-        if (have && t - last_rf >= RF_PERIOD_MS) {
-            last_rf = t;
-            uint32_t code = eepy_encode(rf_seq, (uint8_t)cur, (uint8_t)n_aps,
-                                        rssi, aps[cur].primary, EEPY_FLAG_LOCK);
-            rf_tx_send(code);
-            ESP_LOGI(TAG, "TX seq=%u lock %d/%d rssi=%d %d/s ch=%d", rf_seq,
-                     cur + 1, n_aps, rssi, rate, aps[cur].primary);
-            rf_seq++;
+        if (t - last_rf >= RF_PERIOD_MS) {
+            if (name_pending(t) && (!have || rf_chunk_turn)) {
+                last_rf = t;
+                int k;
+                rf_tx_send(name_next_code(t, &k));
+                rf_chunk_turn = false;
+                ESP_LOGI(TAG, "TX name tag=%u chunk %d/%d (len %d)", name_tag, k + 1,
+                         name_chunks(), name_len);
+            } else if (have) {
+                last_rf = t;
+                uint32_t code = eepy_encode(rf_seq, (uint8_t)cur, (uint8_t)n_aps, rssi,
+                                            aps[cur].primary, name_tag, EEPY_FLAG_LOCK);
+                rf_tx_send(code);
+                rf_chunk_turn = true;
+                ESP_LOGI(TAG, "TX seq=%u lock %d/%d rssi=%d %d/s ch=%d tag=%u", rf_seq,
+                         cur + 1, n_aps, rssi, rate, aps[cur].primary, name_tag);
+                rf_seq++;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(LOOP_MS));

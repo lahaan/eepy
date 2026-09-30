@@ -96,9 +96,18 @@ static unsigned long last_code = 0, last_code_ms = 0;
 
 // Last decoded sample, replayed to a freshly connected phone.
 static bool have_last = false;
-static uint8_t last_seq, last_idx, last_total, last_ch, last_flags;
+static uint8_t last_seq, last_idx, last_total, last_ch, last_tag, last_flags;
 static int last_rssi;
 static unsigned long last_rx_ms = 0;
+
+// SSID reassembled from 433 chunks (rf_proto.h). Samples carry the tag, so a
+// complete name stays valid for as long as the tag keeps matching.
+static int name_tag = -1;
+static uint8_t name_buf[EEPY_SSID_MAX];
+static uint16_t name_have = 0; // bit n = chunk n received
+static int name_end = -1;      // chunk holding the terminator, -1 = not seen
+static bool name_ok = false;
+static int name_len = 0;
 
 // BLE TX ring buffer, drained BLE_CHUNK bytes at a time in loop().
 static char bq[2048];
@@ -163,12 +172,57 @@ static void ble_pump() {
   hub.txc.setValue(buf, n);
 }
 
-// The page keys history on bssid; the hub never learns the real one, so use
-// the AP slot + channel as a stand-in. No SSID over 433 (32-bit codes).
+// The page keys history on bssid; the hub never learns the real one, so the
+// SSID tag stands in. ssid is "" until the name has arrived over 433.
 static void emit_lock() {
-  emit("{\"t\":\"lock\",\"src\":\"rf\",\"i\":%u,\"n\":%u,\"bssid\":\"rf-%u-%u\","
-       "\"ch\":%u,\"ssid\":\"\"}",
-       last_idx + 1, last_total, last_idx + 1, last_ch, last_ch);
+  char ssid[2 * EEPY_SSID_MAX + 1];
+  size_t o = 0;
+  if (name_ok && name_tag == last_tag) {
+    if (!name_len) {
+      strcpy(ssid, "<hidden>"); // same as the probe's scan list
+      o = strlen(ssid);
+    }
+    for (int i = 0; i < name_len; i++) {
+      uint8_t c = name_buf[i];
+      if (c < 0x20) continue;
+      if (c == '"' || c == '\\') ssid[o++] = '\\';
+      ssid[o++] = (char)c;
+    }
+  }
+  ssid[o] = '\0';
+  emit("{\"t\":\"lock\",\"src\":\"rf\",\"i\":%u,\"n\":%u,\"bssid\":\"rf-t%u\","
+       "\"ch\":%u,\"tag\":%u,\"ssid\":\"%s\"}",
+       last_idx + 1, last_total, last_tag, last_ch, last_tag, ssid);
+}
+
+static void name_chunk(uint8_t k, uint8_t b0, uint8_t b1, uint8_t tag) {
+  if (tag != name_tag) { // a new name: start over
+    name_tag = tag;
+    name_have = 0;
+    name_end = -1;
+    name_ok = false;
+  }
+  if (name_ok) {
+    // Periodic refresh of a name we already have; a mismatch means the tag
+    // was reused for a different SSID, so take the new one.
+    if ((2 * k >= name_len || name_buf[2 * k] == b0) &&
+        (2 * k + 1 >= name_len || name_buf[2 * k + 1] == b1))
+      return;
+    name_have = 0;
+    name_end = -1;
+    name_ok = false;
+  }
+  name_buf[2 * k] = b0;
+  name_buf[2 * k + 1] = b1;
+  name_have |= 1u << k;
+  if ((!b0 || !b1) && name_end < 0) name_end = k;
+
+  uint16_t need = name_end >= 0 ? (uint16_t)((1u << (name_end + 1)) - 1) : 0xFFFF;
+  if ((name_have & need) != need) return;
+  name_ok = true;
+  name_len = (int)strnlen((const char *)name_buf, EEPY_SSID_MAX);
+  usb_line("[pico-hub] ssid tag=%d complete (%d bytes)", name_tag, name_len);
+  if (have_last && last_tag == name_tag) emit_lock();
 }
 
 static void emit_sample() {
@@ -283,12 +337,19 @@ void loop() {
       last_code = code;
       last_code_ms = millis();
       got++;
-      uint8_t seq, idx, total, ch, flags;
+      if ((code & 7) == EEPY_FLAG_CHUNK) {
+        uint8_t k, b0, b1, tag;
+        if (eepy_decode_chunk(code, &k, &b0, &b1, &tag)) name_chunk(k, b0, b1, tag);
+        else usb_line("{\"t\":\"rf_bad\",\"why\":\"chunk check\",\"value\":%lu}", code);
+        continue;
+      }
+      uint8_t seq, idx, total, ch, tag, flags;
       int rssi;
-      eepy_decode((uint32_t)code, &seq, &idx, &total, &rssi, &ch, &flags);
-      bool new_ap = !have_last || idx != last_idx || total != last_total || ch != last_ch;
+      eepy_decode(code, &seq, &idx, &total, &rssi, &ch, &tag, &flags);
+      bool new_ap = !have_last || idx != last_idx || total != last_total || ch != last_ch ||
+                    tag != last_tag;
       last_seq = seq, last_idx = idx, last_total = total, last_ch = ch;
-      last_flags = flags, last_rssi = rssi;
+      last_tag = tag, last_flags = flags, last_rssi = rssi;
       last_rx_ms = millis();
       have_last = true;
       if (new_ap) emit_lock();
